@@ -14,8 +14,14 @@ struct TopBarView: View {
                 BrandMark()
 
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("黄果下载")
-                        .font(.headline.weight(.semibold))
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text("黄果下载")
+                            .font(.headline.weight(.semibold))
+                        Text("(如提示当前地区不可用，可将代理切换到新加坡节点后再次尝试)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                     Text(store.statusText.isEmpty ? "PikPak 分享下载" : store.statusText)
                         .font(.caption)
                         .foregroundStyle(.secondary)

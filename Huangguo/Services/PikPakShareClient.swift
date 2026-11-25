@@ -400,6 +400,8 @@ actor PikPakShareClient {
             components.queryItems = query
                 .filter { !$0.value.isEmpty || $0.key == "parent_id" || $0.key == "page_token" || $0.key == "pass_code" }
                 .map { URLQueryItem(name: $0.key, value: $0.value) }
+            // URLQueryItem leaves + unescaped, but servers may decode it as a space.
+            components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
             guard let url = components.url else { throw PikPakError.invalidURL }
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
