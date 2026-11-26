@@ -233,6 +233,30 @@ final class ResumableTransfer: NSObject, URLSessionDataDelegate, @unchecked Send
     }
 }
 
+// Synchronizes cancellation with creation of the URLSession task.
+private final class TransferCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionTask?
+    private var cancelled = false
+
+    func setTask(_ task: URLSessionTask) {
+        lock.lock()
+        self.task = task
+        let shouldCancel = cancelled
+        lock.unlock()
+        if shouldCancel { task.cancel() }
+        else { task.resume() }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let task = self.task
+        lock.unlock()
+        task?.cancel()
+    }
+}
+
 enum FileTransfer {
     static func download(
         from remote: URL,
@@ -260,7 +284,9 @@ enum FileTransfer {
             request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
         }
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+        let cancellation = TransferCancellation()
+        try await withTaskCancellationHandler {
+          try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let monitor = ResumableTransfer(
                 destination: destination,
                 startOffset: offset,
@@ -275,8 +301,12 @@ enum FileTransfer {
             config.httpMaximumConnectionsPerHost = 4
             let session = URLSession(configuration: config, delegate: monitor, delegateQueue: nil)
             monitor.session = session
-            session.dataTask(with: request).resume()
+            cancellation.setTask(session.dataTask(with: request))
+          }
+        } onCancel: {
+            cancellation.cancel()
         }
+        try Task.checkCancellation()
 
         let finalSize = MediaIntegrity.fileSize(at: destination)
         let declared = MediaIntegrity.declaredEnd(at: destination) ?? 0
@@ -296,6 +326,7 @@ final class DownloadManager {
 
     private let client: PikPakShareClient
     private var workerTasks: [UUID: Task<Void, Never>] = [:]
+    private var runningWorkers: Set<UUID> = []
     private let gate: ConcurrencyGate
 
     init(client: PikPakShareClient) {
@@ -346,7 +377,6 @@ final class DownloadManager {
 
     func cancel(_ item: DownloadItem) {
         workerTasks[item.id]?.cancel()
-        workerTasks[item.id] = nil
         if !item.status.canPlay {
             item.status = .cancelled
             item.errorMessage = "已取消"
@@ -363,8 +393,41 @@ final class DownloadManager {
         items.removeAll { $0.status.isFinished }
     }
 
+    func remove(_ ids: Set<UUID>, deleteFiles: Bool) async -> [String] {
+        let selected = items.filter { ids.contains($0.id) }
+        let workers = selected.map { item -> Task<Void, Never>? in
+            let worker = runningWorkers.contains(item.id) ? workerTasks[item.id] : nil
+            cancel(item)
+            return worker
+        }
+        for worker in workers { await worker?.value }
+        var errors: [String] = []
+        for item in selected {
+            if deleteFiles, let url = item.destinationURL ?? item.localURL {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+                    items.removeAll { $0.id == item.id }
+                    continue
+                }
+                if isDirectory.boolValue {
+                    errors.append("\(item.fileName): 目标是文件夹，无法删除")
+                    continue
+                }
+                do {
+                    try FileManager.default.removeItem(at: url)
+                } catch {
+                    errors.append("\(item.fileName): \(error.localizedDescription)")
+                    continue
+                }
+            }
+            items.removeAll { $0.id == item.id }
+        }
+        return errors
+    }
+
     private func start(_ item: DownloadItem, saveRoot: URL) {
         workerTasks[item.id]?.cancel()
+        item.destinationURL = Self.destination(item: item, saveRoot: saveRoot)
         workerTasks[item.id] = Task { [weak self] in
             guard let self else { return }
             await self.gate.acquire()
@@ -375,6 +438,8 @@ final class DownloadManager {
                 item.status = .cancelled
                 return
             }
+            self.runningWorkers.insert(item.id)
+            defer { self.runningWorkers.remove(item.id) }
             await self.perform(item, saveRoot: saveRoot)
         }
     }
@@ -415,6 +480,7 @@ final class DownloadManager {
                         fileId: item.fileId,
                         preferTranscoding: preferTranscoding
                     )
+                    try Task.checkCancellation()
                     try await FileTransfer.download(
                         from: remote,
                         to: destination,
@@ -481,13 +547,18 @@ final class DownloadManager {
         workerTasks[item.id] = nil
     }
 
-    static func makeDestination(item: DownloadItem, saveRoot: URL) throws -> URL {
+    static func destination(item: DownloadItem, saveRoot: URL) -> URL {
         let relative = item.relativePath
             .split(separator: "/")
             .map { PathUtil.sanitize(String($0)) }
             .joined(separator: "/")
         let folder = relative.isEmpty ? saveRoot : saveRoot.appendingPathComponent(relative, isDirectory: true)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder.appendingPathComponent(PathUtil.sanitize(item.fileName))
+    }
+
+    static func makeDestination(item: DownloadItem, saveRoot: URL) throws -> URL {
+        let url = destination(item: item, saveRoot: saveRoot)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        return url
     }
 }

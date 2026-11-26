@@ -33,6 +33,7 @@ final class DownloadItem: Identifiable {
     var bytesPerSecond: Double
     var errorMessage: String?
     var localURL: URL?
+    var destinationURL: URL?
     var retryCount: Int
 
     init(

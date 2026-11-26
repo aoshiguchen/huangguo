@@ -3,6 +3,25 @@ import SwiftUI
 
 struct DownloadQueueView: View {
     @Bindable var store: AppStore
+    @State private var selected: Set<UUID> = []
+    @State private var deleting = false
+    @State private var confirmDelete = false
+    @State private var deletionError: String?
+
+    private var selectedIDs: Set<UUID> {
+        selected.intersection(Set(store.downloads.items.map(\.id)))
+    }
+
+    private func removeSelected(deleteFiles: Bool) {
+        let ids = selectedIDs
+        deleting = true
+        Task {
+            let errors = await store.downloads.remove(ids, deleteFiles: deleteFiles)
+            selected.subtract(ids)
+            if !errors.isEmpty { deletionError = errors.joined(separator: "\n") }
+            deleting = false
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,20 +38,39 @@ struct DownloadQueueView: View {
             .padding(.bottom, 8)
 
             HStack(spacing: 8) {
+                Toggle("全选下载队列", isOn: Binding(
+                    get: { !store.downloads.items.isEmpty && selectedIDs.count == store.downloads.items.count },
+                    set: { selected = $0 ? Set(store.downloads.items.map(\.id)) : [] }
+                ))
+                .labelsHidden()
+                .disabled(store.downloads.items.isEmpty || deleting)
+
                 Button("清除已完成") {
                     store.downloads.clearFinished()
                 }
                 .buttonStyle(QuietButtonStyle())
-                .disabled(store.downloads.items.allSatisfy { !$0.status.isFinished })
+                .disabled(deleting || store.downloads.items.allSatisfy { !$0.status.isFinished })
 
                 Button("全部取消") {
                     store.downloads.cancelAll()
                 }
                 .buttonStyle(QuietButtonStyle())
-                .disabled(store.downloads.items.isEmpty)
+                .disabled(deleting || store.downloads.items.isEmpty)
 
+                Button("删除队列") { removeSelected(deleteFiles: false) }
+                    .buttonStyle(QuietButtonStyle())
+                    .disabled(selectedIDs.isEmpty || deleting)
+                Button("彻底删除队列") { confirmDelete = true }
+                    .buttonStyle(QuietButtonStyle())
+                    .disabled(selectedIDs.isEmpty || deleting)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 4)
+
+            HStack {
                 Spacer()
-
                 Button("打开目录") {
                     try? FileManager.default.createDirectory(at: store.saveDirectory, withIntermediateDirectories: true)
                     NSWorkspace.shared.open(store.saveDirectory)
@@ -52,20 +90,42 @@ struct DownloadQueueView: View {
                 )
             } else {
                 List(store.downloads.items) { item in
-                    DownloadRowView(item: item, saveRoot: store.saveDirectory) {
+                    HStack(alignment: .top, spacing: 8) {
+                        Toggle("选择 \(item.fileName)", isOn: Binding(
+                            get: { selected.contains(item.id) },
+                            set: { if $0 { selected.insert(item.id) } else { selected.remove(item.id) } }
+                        ))
+                        .labelsHidden()
+                        .disabled(deleting)
+                        DownloadRowView(item: item, saveRoot: store.saveDirectory) {
                         store.downloads.retry(item, saveRoot: store.saveDirectory)
                     } onCancel: {
                         store.downloads.cancel(item)
+                        }
                     }
                     .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12))
                     .listRowSeparatorTint(Theme.hairline)
                     .listRowBackground(Color.clear)
                 }
+                .disabled(deleting)
                 .listStyle(.inset)
                 .scrollContentBackground(.hidden)
             }
         }
         .background(Theme.blush.opacity(0.55))
+        .alert("彻底删除队列？", isPresented: $confirmDelete) {
+            Button("取消", role: .cancel) { }
+            Button("彻底删除", role: .destructive) { removeSelected(deleteFiles: true) }
+        } message: {
+            Text("将删除选中的 \(selectedIDs.count) 个队列及其本地文件。")
+        }
+        .alert("删除文件失败", isPresented: Binding(
+            get: { deletionError != nil }, set: { if !$0 { deletionError = nil } }
+        )) {
+            Button("好", role: .cancel) { deletionError = nil }
+        } message: {
+            Text(deletionError ?? "")
+        }
     }
 }
 

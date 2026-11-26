@@ -50,7 +50,7 @@ const statusMeta: Record<
   cancelled: { label: '已取消', color: 'text-muted', icon: <XCircle className="size-3" /> }
 }
 
-function DownloadRow({ item }: { item: DownloadItemDTO }): JSX.Element {
+function DownloadRow({ item, selected, onSelect }: { item: DownloadItemDTO; selected: boolean; onSelect: () => void }): JSX.Element {
   const meta = statusMeta[item.status]
   const progress = Math.min(1, item.receivedBytes / Math.max(item.totalBytes, 1))
   const busy = item.status === 'downloading' || item.status === 'resolving'
@@ -61,6 +61,7 @@ function DownloadRow({ item }: { item: DownloadItemDTO }): JSX.Element {
   return (
     <li className="px-3 py-2">
       <div className="flex items-center gap-2">
+        <input type="checkbox" aria-label={`选择 ${item.fileName}`} checked={selected} onChange={onSelect} />
         <div
           className={`flex size-[26px] shrink-0 items-center justify-center rounded-full ${meta.color}`}
           style={{ backgroundColor: 'color-mix(in srgb, currentColor 16%, transparent)' }}
@@ -134,6 +135,28 @@ function DownloadRow({ item }: { item: DownloadItemDTO }): JSX.Element {
 
 export function DownloadQueue({ state }: { state: AppState }): JSX.Element {
   const [collapsed, setCollapsed] = useState(false)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [deleting, setDeleting] = useState(false)
+  const selectedIds = state.downloads.filter((item) => selected.has(item.id)).map((item) => item.id)
+  const allSelected = state.downloads.length > 0 && selectedIds.length === state.downloads.length
+  const toggleItem = (id: string): void => setSelected((previous) => {
+    const next = new Set(previous)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+  const removeSelected = async (deleteFiles: boolean): Promise<void> => {
+    if (deleteFiles && !window.confirm(`确定彻底删除选中的 ${selectedIds.length} 个队列及其本地文件吗？`)) return
+    setDeleting(true)
+    try {
+      await window.huangguo.removeDownloads(selectedIds, deleteFiles)
+      setSelected(new Set())
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDeleting(false)
+    }
+  }
   const noneFinished = state.downloads.every((item) => !statusIsFinished(item.status))
   if (collapsed) {
     return (
@@ -173,14 +196,23 @@ export function DownloadQueue({ state }: { state: AppState }): JSX.Element {
           进行中 {state.activeCount} · 排队 {state.queuedCount}
         </span>
       </div>
-      <div className="flex gap-2 px-3.5 pb-2.5">
-        <QuietButton disabled={noneFinished} onClick={() => void window.huangguo.clearFinished()}>
+      <div className="flex flex-wrap items-center justify-start gap-2 px-3.5 pb-2.5">
+        <input type="checkbox" aria-label="全选下载队列" checked={allSelected}
+          ref={(element) => { if (element) element.indeterminate = selectedIds.length > 0 && !allSelected }}
+          disabled={state.downloads.length === 0 || deleting}
+          onChange={() => setSelected(allSelected ? new Set() : new Set(state.downloads.map((item) => item.id)))} />
+        <QuietButton disabled={noneFinished || deleting} onClick={() => void window.huangguo.clearFinished()}>
           清除已完成
         </QuietButton>
-        <QuietButton disabled={state.downloads.length === 0} onClick={() => void window.huangguo.cancelAll()}>
+        <QuietButton disabled={state.downloads.length === 0 || deleting} onClick={() => void window.huangguo.cancelAll()}>
           全部取消
         </QuietButton>
-        <span className="flex-1" />
+        <QuietButton disabled={selectedIds.length === 0 || deleting} onClick={() => void removeSelected(false)}>
+          删除队列
+        </QuietButton>
+        <QuietButton disabled={selectedIds.length === 0 || deleting} onClick={() => void removeSelected(true)}>
+          彻底删除队列
+        </QuietButton>
         <QuietButton onClick={() => void window.huangguo.openSaveDirectory()}>打开目录</QuietButton>
       </div>
       <div className="h-px bg-hairline/80" />
@@ -191,9 +223,9 @@ export function DownloadQueue({ state }: { state: AppState }): JSX.Element {
           message="勾选左侧文件，就可以开始下载啦"
         />
       ) : (
-        <ul className="min-h-0 flex-1 overflow-auto">
+        <ul className={`min-h-0 flex-1 overflow-auto ${deleting ? "pointer-events-none opacity-60" : ""}`} aria-busy={deleting}>
           {state.downloads.map((item) => (
-            <DownloadRow key={item.id} item={item} />
+            <DownloadRow key={item.id} item={item} selected={selected.has(item.id)} onSelect={() => toggleItem(item.id)} />
           ))}
         </ul>
       )}

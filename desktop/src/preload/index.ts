@@ -35,6 +35,7 @@ const api: HuangguoAPI = {
   cancelAll: () => ipcRenderer.invoke('download:cancelAll'),
   clearFinished: () => ipcRenderer.invoke('download:clearFinished'),
   remove: (id) => ipcRenderer.invoke('download:remove', id),
+  removeDownloads: (ids, deleteFiles) => ipcRenderer.invoke('download:removeMany', ids, deleteFiles),
   openSaveDirectory: () => ipcRenderer.invoke('download:openDir'),
   openPath: (filePath) => ipcRenderer.invoke('download:openPath', filePath),
   showInFolder: (filePath) => ipcRenderer.invoke('download:showInFolder', filePath),

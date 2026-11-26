@@ -12,8 +12,17 @@ import {
 } from '../../shared/types'
 import { PikPakError, type PendingDownload, type PikPakShareClient } from './client'
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new PikPakError('已取消'))
+  return new Promise((resolve, reject) => {
+    const abort = (): void => reject(new PikPakError('已取消'))
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
+}
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return abortable(new Promise((resolve) => setTimeout(resolve, ms)), signal)
 }
 
 async function fileSize(filePath: string): Promise<number> {
@@ -123,14 +132,13 @@ function requestHeaders(userAgent: string, range?: string): Record<string, strin
   return headers
 }
 
-function writeChunk(stream: WriteStream, chunk: Buffer): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const ok = stream.write(chunk, (error) => {
+function writeChunk(stream: WriteStream, chunk: Buffer, signal: AbortSignal): Promise<void> {
+  return abortable(new Promise((resolve, reject) => {
+    stream.write(chunk, (error) => {
       if (error) reject(error)
+      else resolve()
     })
-    if (ok) resolve()
-    else stream.once('drain', resolve)
-  })
+  }), signal)
 }
 
 async function pumpBody(
@@ -153,6 +161,7 @@ async function pumpBody(
       if (signal.aborted) throw new PikPakError('已取消')
       if (controller.signal.aborted) throw new PikPakError('下载中断，已保留进度')
       const { done, value } = await reader.read()
+      if (signal.aborted) throw new PikPakError('已取消')
       if (done) break
       if (!value || value.byteLength === 0) continue
       bumpStall()
@@ -174,6 +183,7 @@ async function transfer(
   signal: AbortSignal,
   onProgress: (written: number, expected: number) => void
 ): Promise<void> {
+  if (signal.aborted) throw new PikPakError('已取消')
   await mkdir(path.dirname(destination), { recursive: true })
   const existing = await fileSize(destination)
   if (existing > 0 && (await isComplete(destination, expectedSize))) {
@@ -186,6 +196,7 @@ async function transfer(
   const controller = new AbortController()
   const abort = (): void => controller.abort()
   signal.addEventListener('abort', abort)
+  if (signal.aborted) controller.abort()
   let stallTimer: ReturnType<typeof setTimeout> | undefined
   const bumpStall = (): void => {
     if (stallTimer) clearTimeout(stallTimer)
@@ -236,7 +247,7 @@ async function transfer(
       status === 206 ? startedAt + Math.max(0, remoteSize) : Math.max(expectedSize, remoteSize)
     onProgress(received, expected)
     try {
-      await pumpBody(response, (chunk) => writeChunk(stream, chunk), signal, controller, bumpStall, (n) => {
+      await pumpBody(response, (chunk) => writeChunk(stream, chunk, signal), signal, controller, bumpStall, (n) => {
         received += n
         onProgress(received, expected)
       })
@@ -247,7 +258,10 @@ async function transfer(
         })
       })
     } catch (error) {
-      stream.destroy()
+      await new Promise<void>((resolve) => {
+        if (stream.closed) resolve()
+        else { stream.once('close', resolve); stream.destroy() }
+      })
       throw error
     }
   } finally {
@@ -278,10 +292,11 @@ export type DownloadItem = {
   retryCount: number
   openWhenDone?: boolean
   watchURL?: string
+  destination?: string
 }
 
 export function toDTO(item: DownloadItem): DownloadItemDTO {
-  const { openWhenDone: _openWhenDone, watchURL: _watchURL, ...dto } = item
+  const { openWhenDone: _openWhenDone, watchURL: _watchURL, destination: _destination, ...dto } = item
   return dto
 }
 
@@ -301,6 +316,7 @@ export class DownloadManager {
   private readonly gate = new Gate(2)
   private readonly controllers = new Map<string, AbortController>()
   private readonly workers = new Map<string, Promise<void>>()
+  private readonly runningWorkers = new Set<string>()
 
   constructor(
     private readonly client: PikPakShareClient,
@@ -401,21 +417,39 @@ export class DownloadManager {
     this.onChange()
   }
 
-  async remove(id: string, saveRoot: string): Promise<void> {
-    const item = this.items.find((entry) => entry.id === id)
-    if (!item) return
-    this.items = this.items.filter((entry) => entry.id !== id)
+  async removeMany(ids: string[], deleteFiles: boolean): Promise<void> {
+    const selected = this.items.filter((item) => ids.includes(item.id))
+    const workers = selected.map((item) => {
+      const worker = this.runningWorkers.has(item.id) ? this.workers.get(item.id) : undefined
+      this.controllers.get(item.id)?.abort()
+      if (!statusCanPlay(item.status)) item.status = 'cancelled'
+      return worker
+    })
     this.onChange(true)
-    this.controllers.get(id)?.abort()
-    const worker = this.workers.get(id)
-    if (worker) await worker.catch(() => undefined)
-    const dest = item.localPath || makeDestination(item, saveRoot)
-    await rm(dest, { force: true }).catch(() => undefined)
+    await Promise.all(workers.map((worker) => worker?.catch(() => undefined)))
+    const errors: string[] = []
+    for (const item of selected) {
+      try {
+        if (deleteFiles && (item.destination || item.localPath)) {
+          await rm((item.destination || item.localPath)!, { force: true })
+        }
+        this.items = this.items.filter((entry) => entry.id !== item.id)
+      } catch (error) {
+        errors.push(`${item.fileName}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    this.onChange(true)
+    if (errors.length) throw new Error(`删除文件失败：\n${errors.join('\n')}`)
+  }
+
+  async remove(id: string): Promise<void> {
+    await this.removeMany([id], true)
   }
 
   private start(item: DownloadItem, saveRoot: string): void {
     this.controllers.get(item.id)?.abort()
     const controller = new AbortController()
+    item.destination = makeDestination(item, saveRoot)
     this.controllers.set(item.id, controller)
     const worker = (async () => {
       await this.gate.acquire()
@@ -425,8 +459,10 @@ export class DownloadManager {
           this.onChange()
           return
         }
+        this.runningWorkers.add(item.id)
         await this.perform(item, saveRoot, controller.signal)
       } finally {
+        this.runningWorkers.delete(item.id)
         this.gate.release()
         this.workers.delete(item.id)
         this.controllers.delete(item.id)
@@ -469,7 +505,7 @@ export class DownloadManager {
         const startedAt = Date.now()
         const startBytes = await fileSize(destination)
         try {
-          const remote = await this.client.downloadURL(item.fileId, this.preferTranscoding)
+          const remote = await abortable(this.client.downloadURL(item.fileId, this.preferTranscoding), signal)
           item.status = 'downloading'
           this.onChange()
           await transfer(remote, destination, item.expectedSize, this.client.userAgent, signal, (written, expected) => {
@@ -498,7 +534,7 @@ export class DownloadManager {
           }
           if (stagnantRounds >= 2 && (await isPlayable(destination))) break
           if (attempt >= 6) break
-          await sleep(delay)
+          await sleep(delay, signal)
           delay = Math.min(delay * 2, 8000)
         }
       }

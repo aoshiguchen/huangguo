@@ -27,6 +27,7 @@ export type HuangguoAPI = {
   cancelAll: () => Promise<void>
   clearFinished: () => Promise<void>
   remove: (id: string) => Promise<void>
+  removeDownloads: (ids: string[], deleteFiles: boolean) => Promise<void>
   openSaveDirectory: () => Promise<void>
   openPath: (filePath: string) => Promise<void>
   showInFolder: (filePath: string) => Promise<void>

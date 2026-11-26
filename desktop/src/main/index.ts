@@ -94,8 +94,11 @@ function bindIpc(): void {
   ipcMain.handle('download:clearFinished', () => store?.downloads.clearFinished())
   ipcMain.handle('download:remove', (_event, id: string) => {
     if (!store) return
-    return store.downloads.remove(id, store.saveDirectory)
+    return store.downloads.remove(id)
   })
+  ipcMain.handle('download:removeMany', (_event, ids: string[], deleteFiles: boolean) =>
+    store?.downloads.removeMany(ids, deleteFiles)
+  )
   ipcMain.handle('download:openDir', () => store?.openSaveDirectory())
   ipcMain.handle('download:openPath', (_event, filePath: string) => store?.openPath(filePath))
   ipcMain.handle('download:showInFolder', (_event, filePath: string) => store?.showInFolder(filePath))
